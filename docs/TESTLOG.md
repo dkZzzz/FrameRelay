@@ -738,3 +738,18 @@ Files changed: README.md; .gitignore; docs/STATUS.md; docs/TESTLOG.md
 Tests not rerun: 固定 core/App/GStreamer/DMG 完整构建顺序和 clean-environment restart loop；上一条 Phase 3H 记录仍保留对应本地结果，本条不重复宣称。
 Next exact action: 基于已读取的 `origin/main` 提交当前项目内容并推送到 `https://github.com/dkZzzz/FrameRelay`，随后核对远程分支和工作区状态。
 ```
+
+## 2026-09-18 — 项目首个提交和远程推送
+
+```text
+Date: 2026-09-18（Asia/Shanghai）
+Repository: https://github.com/dkZzzz/FrameRelay
+Remote baseline: 14aa52b（仅含远程初始 MIT LICENSE）
+Commit: 59a52bacb3d51fd75156cf38fd1ff2a3e191f90e — chore: initialize FrameRelay receiver
+Push: `git push -u origin main` 成功；远程 `main` 与本地 HEAD 一致
+Files: README.md、.gitignore、FrameRelay Swift/C bridge、构建脚本、文档、许可证、patches 和 pinned UxPlay gitlink
+Result: 项目内容已推送到远程 `main`。根仓库没有未提交的普通文件；`third_party/uxplay` 保持 pinned commit `587111368390479b7f65feb881c9257c02e508b5`，其工作树保留由构建脚本应用的文档补丁，未把这些子模块内改动提交到根仓库。
+Checks: `git status --short --branch`、`git log --oneline --decorate --max-count=3`、`git rev-parse HEAD`、`git rev-parse origin/main`、`git ls-remote --heads origin main`；本地和远程 SHA 均为 `59a52bacb3d51fd75156cf38fd1ff2a3e191f90e`。
+Real-device result: PENDING_REAL_DEVICE；提交和推送不代表 iPhone 15 Pro Max / iOS 26.5 或 Douyin Window Capture 通过。
+Next exact action: 启动新 App，完成真实断连重连、手机音频连续性和 Douyin Window Capture 回归，并把观察结果写入本日志。
+```
