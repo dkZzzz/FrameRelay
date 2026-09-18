@@ -1,0 +1,376 @@
+diff --git a/renderers/avsample_sink.m b/renderers/avsample_sink.m
+index c393a67..e40b76d 100644
+--- a/renderers/avsample_sink.m
++++ b/renderers/avsample_sink.m
+@@ -14,12 +14,18 @@
+ #import <AppKit/AppKit.h>
+ #import <CoreVideo/CoreVideo.h>
+ #import <CoreMedia/CoreMedia.h>
++#import <dispatch/dispatch.h>
++#import <stdint.h>
++#import <stdatomic.h>
++#import <stdlib.h>
++#import <string.h>
+ 
+ // --- C ABI (called from video_renderer.c) -------------------------------------
+ void *avlayer_sink_create(void *nsview_ptr);
+-void  avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned long y_stride,
++int   avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned long y_stride,
+                                 const unsigned char *uv, unsigned long uv_stride,
+-                                int width, int height);
++                                int width, int height, uint64_t pts_ns, uint64_t duration_ns);
++void  avlayer_sink_flush(void *sink);
+ void  avlayer_sink_destroy(void *sink);
+ 
+ typedef struct AVLayerSink {
+@@ -27,6 +33,10 @@ typedef struct AVLayerSink {
+     // publishes it from the main queue while the GStreamer streaming thread is
+     // already calling enqueue().
+     _Atomic(void *) layer;
++    // UxPlay timestamps are relative to the GStreamer pipeline. A dedicated
++    // timebase makes those timestamps meaningful to the display layer rather
++    // than comparing them with the macOS host clock.
++    CMTimebaseRef timebase;
+ } AVLayerSink;
+ 
+ /// Create the display layer and host it in `nsview` (AppKit work on the main thread).
+@@ -46,6 +56,14 @@ void *avlayer_sink_create(void *nsview_ptr) {
+     void (^build)(void) = ^{
+         AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
+         layer.videoGravity = AVLayerVideoGravityResizeAspect; // honest aspect, letterbox
++        CMTimebaseRef timebase = NULL;
++        if (CMTimebaseCreateWithMasterClock(kCFAllocatorDefault,
++                                            CMClockGetHostTimeClock(), &timebase) == noErr && timebase) {
++            CMTimebaseSetTime(timebase, kCMTimeZero);
++            CMTimebaseSetRate(timebase, 1.0);
++            layer.controlTimebase = timebase;
++            s->timebase = timebase;
++        }
+         view.wantsLayer = YES;
+         CALayer *backing = view.layer;
+         backing.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+@@ -54,7 +72,7 @@ void *avlayer_sink_create(void *nsview_ptr) {
+         // kCALayerWidthSizable | kCALayerHeightSizable -> follows the view on resize
+         layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+         [backing addSublayer:layer];
+-        s->layer = (void *)CFBridgingRetain(layer);
++        atomic_store_explicit(&s->layer, (void *)CFBridgingRetain(layer), memory_order_release);
+     };
+     if ([NSThread isMainThread]) {
+         build();
+@@ -66,17 +84,25 @@ void *avlayer_sink_create(void *nsview_ptr) {
+ 
+ /// Wrap an NV12 frame in a CVPixelBuffer + CMSampleBuffer and enqueue it. Safe to
+ /// call from the GStreamer streaming thread (AVSampleBufferDisplayLayer enqueue is
+-/// thread-safe). Frames are tagged display-immediately (lowest latency).
+-void avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+-                               const unsigned char *uv, unsigned long uv_stride,
+-                               int width, int height) {
++/// thread-safe). Valid GStreamer timestamps are retained so the layer can pace
++/// frames; invalid timestamps fall back to display-immediately mode.
++int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
++                              const unsigned char *uv, unsigned long uv_stride,
++                              int width, int height, uint64_t pts_ns, uint64_t duration_ns) {
+     AVLayerSink *s = (AVLayerSink *)sink_;
+-    if (!s || !s->layer || !y || !uv || width <= 0 || height <= 0) return;
+-    AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)s->layer;
++    void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
++    if (!layer_ref || !y || !uv || width <= 0 || height <= 0) return 0;
++    AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
+ 
+     // If the layer failed (e.g. went to background), flush so it accepts frames again.
+     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+-        [layer flush];
++        [layer flushAndRemoveImage];
++    }
++    // Do not build another 3 MB pixel buffer while Core Animation is already
++    // holding its small display queue.  The next decoded frame is newer and is
++    // preferable to growing latency behind a slow consumer.
++    if (!layer.readyForMoreMediaData) {
++        return 0;
+     }
+ 
+     CVPixelBufferRef pb = NULL;
+@@ -90,11 +116,11 @@ void avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned lon
+                                  kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                  (__bridge CFDictionaryRef)attrs, &pb);
+     }
+-    if (rc != kCVReturnSuccess || !pb) return;
++    if (rc != kCVReturnSuccess || !pb) return 0;
+ 
+     if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) {
+         CVPixelBufferRelease(pb); // never unlock a lock that did not succeed
+-        return;
++        return 0;
+     }
+     unsigned char *dy = (unsigned char *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+     unsigned long dys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+@@ -111,23 +137,79 @@ void avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned lon
+     CMVideoFormatDescriptionRef fmt = NULL;
+     if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmt) != noErr || !fmt) {
+         CVPixelBufferRelease(pb);
+-        return;
++        return 0;
+     }
+ 
+-    CMSampleTimingInfo timing = { kCMTimeInvalid, kCMTimeInvalid, kCMTimeInvalid };
++    CMTime presentation_time = kCMTimeInvalid;
++    CMTime duration_time = kCMTimeInvalid;
++    if (pts_ns != UINT64_MAX && s->timebase) {
++        presentation_time = CMTimeMake((int64_t)pts_ns, 1000000000);
++    }
++    if (duration_ns != UINT64_MAX && duration_ns > 0) {
++        duration_time = CMTimeMake((int64_t)duration_ns, 1000000000);
++    }
++    CMSampleTimingInfo timing = { duration_time, presentation_time, kCMTimeInvalid };
+     CMSampleBufferRef sb = NULL;
+     OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &timing, &sb);
+     if (st == noErr && sb) {
+-        CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
+-        if (atts && CFArrayGetCount(atts) > 0) {
+-            CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
+-            CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
++        if (!CMTIME_IS_VALID(presentation_time)) {
++            CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
++            if (atts && CFArrayGetCount(atts) > 0) {
++                CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
++                CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
++            }
+         }
+         [layer enqueueSampleBuffer:sb];
+         CFRelease(sb);
+     }
+     CFRelease(fmt);
+     CVPixelBufferRelease(pb);
++    return (st == noErr && sb != NULL) ? 1 : 0;
++}
++
++/// Drop the queued/current image when AirPlay sends its pause marker (0x56) or
++/// before a new session resumes.  This is a Core Media operation, not an
++/// AppKit operation, and is safe on the GStreamer worker thread.
++void avlayer_sink_flush(void *sink_) {
++    AVLayerSink *s = (AVLayerSink *)sink_;
++    void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
++    if (!layer_ref) return;
++    AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
++    if (s->timebase) {
++        CMTimebaseSetRate(s->timebase, 0.0);
++        CMTimebaseSetTime(s->timebase, kCMTimeZero);
++        CMTimebaseSetRate(s->timebase, 1.0);
++    }
++    [layer flushAndRemoveImage];
++}
++
++/// Pause the presentation clock as well as removing the old image. Keeping the
++/// timebase stopped prevents a phone lock interval from making the first
++/// post-unlock timestamp look stale.
++void avlayer_sink_pause(void *sink_) {
++    AVLayerSink *s = (AVLayerSink *)sink_;
++    void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
++    if (!layer_ref) return;
++    AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
++    [layer flushAndRemoveImage];
++    if (s->timebase) {
++        CMTimebaseSetRate(s->timebase, 0.0);
++        CMTimebaseSetTime(s->timebase, kCMTimeZero);
++    }
++}
++
++/// Resume from a fresh zero point. The AirPlay stream sends a new IDR after
++/// the resume marker, so no old sample is allowed to remain in the queue.
++void avlayer_sink_resume(void *sink_) {
++    AVLayerSink *s = (AVLayerSink *)sink_;
++    void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
++    if (!layer_ref) return;
++    AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
++    [layer flushAndRemoveImage];
++    if (s->timebase) {
++        CMTimebaseSetTime(s->timebase, kCMTimeZero);
++        CMTimebaseSetRate(s->timebase, 1.0);
++    }
+ }
+ 
+ /// Detach + release the layer (AppKit work must run on the main thread).
+@@ -153,13 +235,16 @@ void avlayer_sink_destroy(void *sink_) {
+     AVLayerSink *s = (AVLayerSink *)sink_;
+     if (!s) return;
+     void (^cleanup)(void) = ^{
+-        void *layer_ref = s->layer;
+-        s->layer = NULL;
++        void *layer_ref = atomic_exchange_explicit(&s->layer, NULL, memory_order_acq_rel);
+         if (layer_ref) {
+             AVSampleBufferDisplayLayer *layer = (AVSampleBufferDisplayLayer *)CFBridgingRelease(layer_ref);
+-            [layer flush];
++            [layer flushAndRemoveImage];
+             [layer removeFromSuperlayer];
+         }
++        if (s->timebase) {
++            CFRelease(s->timebase);
++            s->timebase = NULL;
++        }
+         free(s);
+     };
+     if ([NSThread isMainThread]) {
+diff --git a/renderers/video_renderer.c b/renderers/video_renderer.c
+index 288dd53..e7b55cf 100644
+--- a/renderers/video_renderer.c
++++ b/renderers/video_renderer.c
+@@ -48,27 +48,53 @@ extern void *airplay_get_host_window (void);
+ #include <gst/app/gstappsink.h>
+ #include <gst/video/video.h>
+ extern void *avlayer_sink_create(void *nsview);
+-extern void  avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned long ys,
+-                                        const unsigned char *uv, unsigned long uvs, int w, int h);
++extern int   avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned long ys,
++                                        const unsigned char *uv, unsigned long uvs, int w, int h,
++                                        uint64_t pts_ns, uint64_t duration_ns);
++extern void  avlayer_sink_flush(void *sink);
++extern void  avlayer_sink_pause(void *sink);
++extern void  avlayer_sink_resume(void *sink);
+ extern void  avlayer_sink_destroy(void *sink);
+ 
++/* The appsink callback is deliberately the only place that emits these
++ * counters.  They are reported once per second, not once per frame, so a
++ * live diagnostic log can show the negotiated output cadence and drops
++ * without becoming another source of latency. */
++static guint64 avlayer_frames_pulled = 0;
++static guint64 avlayer_frames_enqueued = 0;
++static guint64 avlayer_frames_dropped = 0;
++static gint64 avlayer_stats_started_us = 0;
++
++static void avlayer_report_stats(void);
++
+ static GstFlowReturn avlayer_on_new_sample(GstAppSink *appsink, gpointer user_data) {
+     GstSample *sample = gst_app_sink_pull_sample(appsink);
+     if (!sample) return GST_FLOW_OK;
++    avlayer_frames_pulled++;
+     GstBuffer *buf = gst_sample_get_buffer(sample);
+     GstCaps *caps = gst_sample_get_caps(sample);
+     GstVideoInfo info;
+     if (buf && caps && gst_video_info_from_caps(&info, caps)) {
+         GstVideoFrame frame;
+         if (gst_video_frame_map(&frame, &info, buf, GST_MAP_READ)) {
+-            avlayer_sink_enqueue_nv12(user_data,
++            if (avlayer_sink_enqueue_nv12(user_data,
+                 GST_VIDEO_FRAME_PLANE_DATA(&frame, 0), GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0),
+                 GST_VIDEO_FRAME_PLANE_DATA(&frame, 1), GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 1),
+-                GST_VIDEO_FRAME_WIDTH(&frame), GST_VIDEO_FRAME_HEIGHT(&frame));
++                GST_VIDEO_FRAME_WIDTH(&frame), GST_VIDEO_FRAME_HEIGHT(&frame),
++                (uint64_t)GST_BUFFER_PTS(buf), (uint64_t)GST_BUFFER_DURATION(buf))) {
++                avlayer_frames_enqueued++;
++            } else {
++                avlayer_frames_dropped++;
++            }
+             gst_video_frame_unmap(&frame);
++        } else {
++            avlayer_frames_dropped++;
+         }
++    } else {
++        avlayer_frames_dropped++;
+     }
+     gst_sample_unref(sample);
++    avlayer_report_stats();
+     return GST_FLOW_OK;
+ }
+ #endif
+@@ -108,6 +134,32 @@ static int type_265 = 0;
+ static int type_hls = 0;
+ static int type_jpeg = 0;
+ 
++#ifdef __APPLE__
++static void avlayer_report_stats(void) {
++    gint64 now_us = g_get_monotonic_time();
++    if (avlayer_stats_started_us == 0) {
++        avlayer_stats_started_us = now_us;
++        return;
++    }
++    gint64 elapsed_us = now_us - avlayer_stats_started_us;
++    if (elapsed_us < G_USEC_PER_SEC) return;
++
++    double seconds = (double)elapsed_us / (double)G_USEC_PER_SEC;
++    logger_log(logger, LOGGER_INFO,
++               "avlayer performance: pulled=%" G_GUINT64_FORMAT
++               " enqueued=%" G_GUINT64_FORMAT
++               " dropped=%" G_GUINT64_FORMAT
++               " output_fps=%.1f drop_fps=%.1f",
++               avlayer_frames_pulled, avlayer_frames_enqueued, avlayer_frames_dropped,
++               (double)avlayer_frames_enqueued / seconds,
++               (double)avlayer_frames_dropped / seconds);
++    avlayer_frames_pulled = 0;
++    avlayer_frames_enqueued = 0;
++    avlayer_frames_dropped = 0;
++    avlayer_stats_started_us = now_us;
++}
++#endif
++
+ typedef enum {
+   //GST_PLAY_FLAG_VIDEO         = (1 << 0),
+   //GST_PLAY_FLAG_AUDIO         = (1 << 1),
+@@ -563,12 +615,13 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+                 /* PATCH (Plan B): "avlayer" -> custom AVSampleBufferDisplayLayer sink.
+                  * We force NV12 into an appsink and pump frames to our own layer
+                  * (see avlayer_on_new_sample / avsample_sink.m).  drop=true +
+-                 * max-buffers keep latency flat; sync=false renders ASAP. */
++                 * max-buffers keep latency bounded; the appsink itself remains
++                 * unsynchronised while the AV layer receives the original PTS. */
+                 if (!strcmp(videosink, "avlayer") && !jpeg_pipeline) {
+                     g_string_append(launch, "videoconvert ! video/x-raw,format=NV12 ! appsink name=avlayer_");
+                     g_string_append(launch, renderer_type[i]->codec);
+                     g_string_append(launch, " emit-signals=false sync=false max-buffers=3 drop=true");
+-                    vsync_prop = false;
++                    vsync_prop = video_sync;
+                 } else {
+ #endif
+                 g_string_append(launch, videosink);
+@@ -861,6 +914,15 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+                then fails the PLAYING transition and returns -1 to the caller. */
+         }
+     }
++#ifdef __APPLE__
++    /* The JPEG cover-art renderer is constructed after h264/h265 and also
++     * writes the historical process-global flag.  Restore the mirror setting
++     * explicitly so a cover-art-capable build cannot silently strip PTS from
++     * the live video path. */
++    if (!hls_video && type_264 >= 0) {
++        vsync_prop = video_sync;
++    }
++#endif
+ }
+ 
+ void video_renderer_pause() {
+@@ -868,6 +930,11 @@ void video_renderer_pause() {
+         return;
+     }
+     GstStateChangeReturn ret = gst_element_set_state(renderer->pipeline, GST_STATE_PAUSED);
++#ifdef __APPLE__
++    if (renderer->avlayer) {
++        avlayer_sink_pause(renderer->avlayer);
++    }
++#endif
+     logger_log(logger, LOGGER_DEBUG, "video renderer pause: %s", gst_element_state_change_return_get_name(ret));
+ }
+ 
+@@ -875,6 +942,11 @@ void video_renderer_resume() {
+     if (!renderer) {
+         return;
+     }
++#ifdef __APPLE__
++    if (renderer->avlayer) {
++        avlayer_sink_resume(renderer->avlayer);
++    }
++#endif
+     gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+     GstState state;
+     /* wait with timeout 100 msec for pipeline to change state from PAUSED to PLAYING */
+@@ -1058,6 +1130,11 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
+ }
+ 
+ void video_renderer_flush() {
++#ifdef __APPLE__
++    if (renderer && renderer->avlayer) {
++        avlayer_sink_flush(renderer->avlayer);
++    }
++#endif
+ }
+ 
+ void video_renderer_hls_ready() {

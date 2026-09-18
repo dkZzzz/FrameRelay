@@ -1,0 +1,160 @@
+From 0010frozenavlayer Mon Sep 17 00:00:00 2001
+From: FrameRelay <framerelay@localhost>
+Date: Thu, 17 Sep 2026 00:00:00 +0800
+Subject: [PATCH] uxplay: recover a live AVLayer stuck in readiness backpressure
+
+The live AVSampleBufferDisplayLayer path can keep receiving decoded frames
+while readyForMoreMediaData remains false indefinitely. After two bounded
+flush-and-seed attempts, report a controlled restart request to the host.
+
+---
+ renderers/avsample_sink.h |   2 +
+ renderers/avsample_sink.m |  80 ++++++++++++++++++++++++++++++++++++++++++++++
+ renderers/video_renderer.c |  13 ++++++++
+ 3 files changed, 95 insertions(+)
+
+diff --git a/renderers/avsample_sink.h b/renderers/avsample_sink.h
+--- a/renderers/avsample_sink.h
++++ b/renderers/avsample_sink.h
+@@ -25,6 +25,8 @@ typedef struct AVLayerSinkDiagnostics {
+     uint64_t sample_ns_total;
+     uint64_t sample_ns_max;
+     uint64_t enqueue_count;
++    uint64_t ready_watchdog_flushes;
++    uint64_t ready_watchdog_escalations;
+     uint64_t resume_recovery_count;
+     uint64_t resume_recovery_ns_total;
+     uint64_t resume_recovery_ns_max;
+diff --git a/renderers/avsample_sink.m b/renderers/avsample_sink.m
+--- a/renderers/avsample_sink.m
++++ b/renderers/avsample_sink.m
+@@ -20,4 +20,7 @@
+ 
+ #include "avsample_sink.h"
+ 
++#define AVLAYER_READY_WATCHDOG_INTERVAL_NS UINT64_C(3000000000)
++#define AVLAYER_READY_WATCHDOG_MAX_FLUSHES 2
++
+ typedef struct AVLayerSink {
+@@ -57,4 +60,9 @@ typedef struct AVLayerSink {
+     _Atomic uint64_t sample_ns_total;
+     _Atomic uint64_t sample_ns_max;
+     _Atomic uint64_t enqueue_count;
++    _Atomic uint64_t ready_watchdog_flushes;
++    _Atomic uint64_t ready_watchdog_escalations;
++    _Atomic uint64_t ready_reject_started_ns;
++    _Atomic uint32_t ready_watchdog_attempts;
++    _Atomic bool ready_watchdog_escalated;
+     _Atomic uint64_t resume_recovery_count;
+@@ -85,4 +93,46 @@ static void avlayer_atomic_max(_Atomic uint64_t *target, uint64_t value) {
+     }
+ }
+ 
++static void avlayer_reset_ready_watchdog(AVLayerSink *s) {
++    atomic_store_explicit(&s->ready_reject_started_ns, 0, memory_order_release);
++    atomic_store_explicit(&s->ready_watchdog_attempts, 0, memory_order_release);
++    atomic_store_explicit(&s->ready_watchdog_escalated, false, memory_order_release);
++}
++
++static void avlayer_watch_ready_state(AVLayerSink *s, AVSampleBufferDisplayLayer *layer) {
++    uint64_t now_ns = avlayer_now_ns();
++    if (now_ns == 0) return;
++
++    uint64_t started_ns = atomic_load_explicit(&s->ready_reject_started_ns, memory_order_acquire);
++    if (started_ns == 0) {
++        atomic_compare_exchange_strong_explicit(&s->ready_reject_started_ns, &started_ns, now_ns,
++                                                memory_order_acq_rel, memory_order_acquire);
++        return;
++    }
++    if (now_ns < started_ns || now_ns - started_ns < AVLAYER_READY_WATCHDOG_INTERVAL_NS) {
++        return;
++    }
++
++    // Start a new observation interval. A successful seed or an ordinary
++    // accepted frame clears the episode below; this prevents repeated flushes
++    // while the layer is healthy again.
++    atomic_store_explicit(&s->ready_reject_started_ns, now_ns, memory_order_release);
++    uint32_t attempts = atomic_load_explicit(&s->ready_watchdog_attempts, memory_order_acquire);
++    if (attempts < AVLAYER_READY_WATCHDOG_MAX_FLUSHES) {
++        atomic_fetch_add_explicit(&s->ready_watchdog_attempts, 1, memory_order_acq_rel);
++        atomic_fetch_add_explicit(&s->ready_watchdog_flushes, 1, memory_order_relaxed);
++        [layer flushAndRemoveImage];
++        // Arm only after the flush, so a frame racing with the flush cannot
++        // consume the permit and then get removed by the flush itself.
++        atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
++        return;
++    }
++
++    bool expected = false;
++    if (atomic_compare_exchange_strong_explicit(&s->ready_watchdog_escalated, &expected, true,
++                                                memory_order_acq_rel, memory_order_acquire)) {
++        atomic_fetch_add_explicit(&s->ready_watchdog_escalations, 1, memory_order_relaxed);
++    }
++}
++
+ static void avlayer_init_diagnostics(AVLayerSink *s) {
+@@ -108,4 +163,9 @@ static void avlayer_init_diagnostics(AVLayerSink *s) {
+     atomic_init(&s->sample_ns_total, 0);
+     atomic_init(&s->sample_ns_max, 0);
+     atomic_init(&s->enqueue_count, 0);
++    atomic_init(&s->ready_watchdog_flushes, 0);
++    atomic_init(&s->ready_watchdog_escalations, 0);
++    atomic_init(&s->ready_reject_started_ns, 0);
++    atomic_init(&s->ready_watchdog_attempts, 0);
++    atomic_init(&s->ready_watchdog_escalated, false);
+     atomic_init(&s->resume_recovery_count, 0);
+@@ -231,4 +231,5 @@ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+     bool resume_seed = atomic_compare_exchange_strong_explicit(
+         &s->resume_seed_pending, &expected_seed, false,
+         memory_order_acq_rel, memory_order_acquire);
++    bool layer_was_ready = layer.readyForMoreMediaData;
+ 
+@@ -245,4 +246,5 @@ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+-    if (!layer.readyForMoreMediaData && !resume_seed) {
++    if (!layer_was_ready && !resume_seed) {
+         atomic_fetch_add_explicit(&s->ready_rejects, 1, memory_order_relaxed);
++        avlayer_watch_ready_state(s, layer);
+         return 0;
+     }
+@@ -352,3 +354,4 @@ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+     CVPixelBufferRelease(pb);
+-    if (accepted) {
++    if (accepted && !(resume_seed && !layer_was_ready)) {
++        avlayer_reset_ready_watchdog(s);
+         bool expected = true;
+@@ -430,4 +433,6 @@ void avlayer_sink_get_diagnostics(void *sink_, AVLayerSinkDiagnostics *out) {
+     AV_COPY_DIAG(sample_ns_total);
+     out->sample_ns_max = atomic_exchange_explicit(&s->sample_ns_max, 0, memory_order_acq_rel);
+     AV_COPY_DIAG(enqueue_count);
++    AV_COPY_DIAG(ready_watchdog_flushes);
++    AV_COPY_DIAG(ready_watchdog_escalations);
+     AV_COPY_DIAG(resume_recovery_count);
+diff --git a/renderers/video_renderer.c b/renderers/video_renderer.c
+--- a/renderers/video_renderer.c
++++ b/renderers/video_renderer.c
+@@ -427,3 +427,5 @@ static void avlayer_report_stats(void) {
+                " sample=%" G_GUINT64_FORMAT " sample_fail=%" G_GUINT64_FORMAT
+                " sample_avg_ms=%.3f sample_max_ms=%.3f enqueue=%" G_GUINT64_FORMAT
++               " ready_watchdog_flushes=%" G_GUINT64_FORMAT
++               " ready_watchdog_escalations=%" G_GUINT64_FORMAT
+                " recovery=%" G_GUINT64_FORMAT " recovery_avg_ms=%.3f recovery_max_ms=%.3f",
+@@ -440,6 +442,7 @@ static void avlayer_report_stats(void) {
+                sink.format_count, sink.format_failures, format_avg_ms,
+                (double)sink.format_ns_max / 1000000.0,
+                sink.sample_count, sink.sample_failures, sample_avg_ms,
+-               (double)sink.sample_ns_max / 1000000.0, sink.enqueue_count,
++               (double)sink.sample_ns_max / 1000000.0, sink.enqueue_count,
++               sink.ready_watchdog_flushes, sink.ready_watchdog_escalations,
+                sink.resume_recovery_count, recovery_avg_ms,
+                (double)sink.resume_recovery_ns_max / 1000000.0);
++    if (sink.ready_watchdog_escalations > 0) {
++        logger_log(logger, LOGGER_ERR,
++                   "FrameRelay avlayer watchdog: action=restart reason=ready-stuck "
++                   "flushes=%" G_GUINT64_FORMAT " escalations=%" G_GUINT64_FORMAT,
++                   sink.ready_watchdog_flushes, sink.ready_watchdog_escalations);
++    }
+ }
+ #endif
+
+-- 
+2.45.2

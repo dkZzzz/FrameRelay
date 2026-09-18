@@ -1,0 +1,156 @@
+diff --git a/renderers/audio_renderer.c b/renderers/audio_renderer.c
+index 0c85b8c..dcaac06 100644
+--- a/renderers/audio_renderer.c
++++ b/renderers/audio_renderer.c
+@@ -41,6 +41,12 @@ static gboolean async = FALSE;
+ static gboolean vsync = FALSE;
+ static gboolean sync = FALSE;
+ static gboolean audio_rtp = FALSE;
++static uint64_t audio_received = 0;
++static uint64_t audio_valid = 0;
++static uint64_t audio_invalid = 0;
++static uint64_t audio_pushed = 0;
++static uint64_t audio_flow_errors = 0;
++static gint64 audio_last_report_us = 0;
+ 
+ typedef struct audio_renderer_s {
+     GstElement *appsrc; 
+@@ -208,6 +214,11 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {
+                     async = FALSE;
+                 }
+                 break;
++            case 0:  /* AAC-ELD mirror audio is a live arrival-paced stream. */
++            case 2:  /* AAC-LC mirror audio is a live arrival-paced stream. */
++                g_string_append (launch, " sync=false");
++                vsync = FALSE;
++                break;
+             default:
+                 if (*video_sync) {
+                     g_string_append (launch, " sync=true");
+@@ -315,7 +326,11 @@ static void get_renderer_type(unsigned char *ct, int *id) {
+         } else {
+             logger_log(logger, LOGGER_INFO, "*** GStreamer libav plugin feature avdec_aac is missing, cannot decode AAC audio");
+         }
+-        sync = vsync;
++        /* AirPlay/NTP time and a newly-created GStreamer appsrc do not share
++           a clock domain after an audio reconnect.  Mirror AAC is live media;
++           let the sink pace buffers by arrival instead of dropping them when
++           the two domains are temporarily ordered differently. */
++        sync = FALSE;
+         break;
+     case 1:
+         if (alac) {
+@@ -338,22 +353,29 @@ void  audio_renderer_start(unsigned char *ct) {
+     int id = -1;
+     get_renderer_type(ct, &id);
+     if (id >= 0 && renderer) {
+-        if(*ct != renderer->ct) {
+-            gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
+-            gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+-            logger_log(logger, LOGGER_INFO, "changed audio connection, format %s", format[id]);
+-            renderer = renderer_type[id];
+-            gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+-            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+-        }
++        bool format_changed = (*ct != renderer->ct);
++        gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
++        gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
++        logger_log(logger, LOGGER_INFO, "%s audio connection, format %s, sync=%s",
++                   format_changed ? "changed" : "restarting", format[id], sync ? "true" : "false");
++        renderer = renderer_type[id];
++        gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
++        gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+     } else if (id >= 0) {
+-        logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);
++        logger_log(logger, LOGGER_INFO, "start audio connection, format %s, sync=%s",
++                   format[id], sync ? "true" : "false");
+         renderer = renderer_type[id];
+         gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+         gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+     } else {
+         logger_log(logger, LOGGER_ERR, "unknown audio compression type ct = %d", *ct);
+     }
++    audio_received = 0;
++    audio_valid = 0;
++    audio_invalid = 0;
++    audio_pushed = 0;
++    audio_flow_errors = 0;
++    audio_last_report_us = g_get_monotonic_time();
+ }
+ 
+ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
+@@ -361,6 +383,9 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned sh
+ 
+     if (!render_audio) return;    /* do nothing unless render_audio == TRUE */
+ 
++    if (data == NULL || data_len == NULL || *data_len <= 0 || renderer == NULL) return;
++    audio_received++;
++
+     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
+     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
+     if (sync) {
+@@ -372,8 +397,6 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned sh
+             return;
+         }
+     }
+-    if (data_len == 0 || renderer == NULL) return;
+-
+     /* all audio received seems to be either ct = 8 (AAC_ELD 44100/2 spf 460 ) AirPlay Mirror protocol *
+      * or ct = 2 (ALAC 44100/16/2 spf 352) AirPlay protocol.                                           *
+      * first byte data[0] of ALAC frame is 0x20,                                                       *
+@@ -381,13 +404,6 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned sh
+      *                   but is 0x80, 0x81 or 0x82: 0x100000(00,01,10) in ios9, ios10 devices          *
+      * first byte of AAC_LC should be 0xff (ADTS) (but has never been  seen).                          */
+     
+-    buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
+-    g_assert(buffer != NULL);
+-    //g_print("audio latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
+-    if (sync) {
+-        GST_BUFFER_PTS(buffer) = pts;
+-    }
+-    gst_buffer_fill(buffer, 0, data, *data_len);
+     bool valid = false;
+     switch (renderer->ct){
+     case 8: /*AAC-ELD*/
+@@ -416,12 +432,40 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned sh
+         break;
+     }
+     if (valid) {
+-        gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
++        audio_valid++;
++        buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
++        g_assert(buffer != NULL);
++        //g_print("audio latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
++        if (sync) {
++            GST_BUFFER_PTS(buffer) = pts;
++        }
++        gst_buffer_fill(buffer, 0, data, *data_len);
++        GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
++        if (flow == GST_FLOW_OK) {
++            audio_pushed++;
++        } else {
++            audio_flow_errors++;
++            logger_log(logger, LOGGER_ERR, "FrameRelay audio push failed: flow=%s (%d)",
++                       gst_flow_get_name(flow), flow);
++        }
+     } else {
++        audio_invalid++;
+         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
+         logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
+     }
++
++    gint64 now_us = g_get_monotonic_time();
++    if (now_us - audio_last_report_us >= 5000000) {
++        logger_log(logger, LOGGER_INFO,
++                   "FrameRelay audio stats: received=%llu valid=%llu invalid=%llu pushed=%llu flow_errors=%llu sync=%s",
++                   (unsigned long long) audio_received,
++                   (unsigned long long) audio_valid,
++                   (unsigned long long) audio_invalid,
++                   (unsigned long long) audio_pushed,
++                   (unsigned long long) audio_flow_errors,
++                   sync ? "true" : "false");
++        audio_last_report_us = now_us;
+     }
+ }
+ 
+ void audio_renderer_set_volume(double volume) {

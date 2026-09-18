@@ -1,0 +1,113 @@
+diff --git a/renderers/avsample_sink.m b/renderers/avsample_sink.m
+index e9602d6..0000000 100644
+--- a/renderers/avsample_sink.m
++++ b/renderers/avsample_sink.m
+@@ -60,6 +60,16 @@ typedef struct AVLayerSink {
+     _Atomic uint64_t resume_recovery_ns_max;
+     _Atomic uint64_t pause_started_ns;
+     _Atomic bool waiting_for_resume_frame;
++    // A resumed stream must establish the display-clock anchor at the moment
++    // its first decoded frame arrives.  Starting the host-backed timebase at
++    // the resume marker makes a delayed first frame appear late and can leave
++    // AVSampleBufferDisplayLayer permanently not-ready.
++    _Atomic bool resume_timebase_anchor_pending;
++    // Permit exactly one post-resume sample through the readiness gate.  Apple
++    // documents enqueueSampleBuffer: as safe when readyForMoreMediaData is NO;
++    // this seed is needed to wake a layer after a flush, without allowing an
++    // unbounded queue during ordinary back-pressure.
++    _Atomic bool resume_seed_pending;
+ } AVLayerSink;
+ 
+ static uint64_t avlayer_now_ns(void) {
+@@ -105,6 +115,29 @@ static void avlayer_init_diagnostics(AVLayerSink *s) {
+     atomic_init(&s->resume_recovery_ns_max, 0);
+     atomic_init(&s->pause_started_ns, 0);
+     atomic_init(&s->waiting_for_resume_frame, false);
++    atomic_init(&s->resume_timebase_anchor_pending, false);
++    atomic_init(&s->resume_seed_pending, false);
++}
++
++static bool avlayer_anchor_resume_timebase(AVLayerSink *s, uint64_t pts_ns) {
++    if (!s || !s->timebase || pts_ns == UINT64_MAX) return false;
++
++    bool expected = true;
++    if (!atomic_compare_exchange_strong_explicit(&s->resume_timebase_anchor_pending,
++                                                  &expected, false,
++                                                  memory_order_acq_rel,
++                                                  memory_order_acquire)) {
++        return false;
++    }
++
++    // The renderer's PTS is relative to the freshly rebased stream.  Anchor
++    // that media time to "now", rather than allowing a long lock-screen gap
++    // between resume and the first decoded frame to make PTS zero late.
++    CMTime first_time = CMTimeMake((int64_t)pts_ns, 1000000000);
++    CMTimebaseSetRate(s->timebase, 0.0);
++    CMTimebaseSetTime(s->timebase, first_time);
++    CMTimebaseSetRate(s->timebase, 1.0);
++    return true;
+ }
+ 
+ /// Create the display layer and host it in `nsview` (AppKit work on the main thread).
+@@ -166,5 +205,15 @@ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+     }
+     AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
+ 
++    // On resume, the first decoded frame establishes the media-to-host clock
++    // mapping.  Do this before reading readyForMoreMediaData: the old mapping
++    // is exactly what can keep the layer reporting NO after a long pause.
++    (void)avlayer_anchor_resume_timebase(s, pts_ns);
++
++    bool expected_seed = true;
++    bool resume_seed = atomic_compare_exchange_strong_explicit(
++        &s->resume_seed_pending, &expected_seed, false,
++        memory_order_acq_rel, memory_order_acquire);
++
+     // If the layer failed (e.g. went to background), flush so it accepts frames again.
+     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+@@ -176,6 +226,6 @@ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+     // holding its small display queue.  The next decoded frame is newer and is
+     // preferable to growing latency behind a slow consumer.
+-    if (!layer.readyForMoreMediaData) {
++    if (!layer.readyForMoreMediaData && !resume_seed) {
+         atomic_fetch_add_explicit(&s->ready_rejects, 1, memory_order_relaxed);
+         return 0;
+     }
+@@ -285,6 +335,11 @@ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+             atomic_fetch_add_explicit(&s->resume_recovery_ns_total, recovery_ns, memory_order_relaxed);
+             avlayer_atomic_max(&s->resume_recovery_ns_max, recovery_ns);
+         }
++    } else if (resume_seed) {
++        // Keep the one-shot seed available if sample construction failed; a
++        // transient Core Media allocation failure must not make the next frame
++        // subject to the stale readiness state again.
++        atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
+     }
+     return accepted ? 1 : 0;
+ }
+@@ -315,5 +371,7 @@ void avlayer_sink_pause(void *sink_) {
+     if (!s) return;
+     atomic_store_explicit(&s->pause_started_ns, avlayer_now_ns(), memory_order_release);
+     atomic_store_explicit(&s->waiting_for_resume_frame, true, memory_order_release);
++    atomic_store_explicit(&s->resume_timebase_anchor_pending, true, memory_order_release);
++    atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
+     void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
+     if (!layer_ref) return;
+@@ -331,9 +389,15 @@ void avlayer_sink_resume(void *sink_) {
++    if (!s) return;
++    atomic_store_explicit(&s->resume_timebase_anchor_pending, true, memory_order_release);
++    atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
+     void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
+     if (!layer_ref) return;
+     AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
+     [layer flushAndRemoveImage];
+     if (s->timebase) {
+-        CMTimebaseSetTime(s->timebase, kCMTimeZero);
+-        CMTimebaseSetRate(s->timebase, 1.0);
++        // Keep the clock stopped until the first post-resume frame anchors it.
++        // The previous implementation started rate=1 here, so a delayed first
++        // frame with PTS zero arrived already in the past.
++        CMTimebaseSetRate(s->timebase, 0.0);
++        CMTimebaseSetTime(s->timebase, kCMTimeZero);
+     }
+ }

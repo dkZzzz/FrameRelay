@@ -1,0 +1,284 @@
+--- a/renderers/avsample_sink.m
++++ b/renderers/avsample_sink.m
+@@ -28,11 +28,6 @@
+     // publishes it from the main queue while the GStreamer streaming thread is
+     // already calling enqueue().
+     _Atomic(void *) layer;
+-    // UxPlay timestamps are relative to the GStreamer pipeline. A dedicated
+-    // timebase makes those timestamps meaningful to the display layer rather
+-    // than comparing them with the macOS host clock.
+-    CMTimebaseRef timebase;
+-
+     // These counters are sampled and reset by the renderer once per second.
+     // They are deliberately kept in the Objective-C/C hot path so the Swift
+     // side never runs once per frame.
+@@ -62,15 +57,11 @@
+     _Atomic uint64_t resume_recovery_ns_max;
+     _Atomic uint64_t pause_started_ns;
+     _Atomic bool waiting_for_resume_frame;
+-    // A resumed stream must establish the display-clock anchor at the moment
+-    // its first decoded frame arrives.  Starting the host-backed timebase at
+-    // the resume marker makes a delayed first frame appear late and can leave
+-    // AVSampleBufferDisplayLayer permanently not-ready.
+-    _Atomic bool resume_timebase_anchor_pending;
+     // Permit exactly one post-resume sample through the readiness gate.  Apple
+     // documents enqueueSampleBuffer: as safe when readyForMoreMediaData is NO;
+     // this seed is needed to wake a layer after a flush, without allowing an
+-    // unbounded queue during ordinary back-pressure.
++    // unbounded queue during ordinary back-pressure.  The live path below uses
++    // display-immediately samples, so the seed has no timestamp to wait for.
+     _Atomic bool resume_seed_pending;
+ } AVLayerSink;
+ 
+@@ -118,31 +109,9 @@
+     atomic_init(&s->resume_recovery_ns_max, 0);
+     atomic_init(&s->pause_started_ns, 0);
+     atomic_init(&s->waiting_for_resume_frame, false);
+-    atomic_init(&s->resume_timebase_anchor_pending, false);
+     atomic_init(&s->resume_seed_pending, false);
+ }
+ 
+-static bool avlayer_anchor_resume_timebase(AVLayerSink *s, uint64_t pts_ns) {
+-    if (!s || !s->timebase || pts_ns == UINT64_MAX) return false;
+-
+-    bool expected = true;
+-    if (!atomic_compare_exchange_strong_explicit(&s->resume_timebase_anchor_pending,
+-                                                  &expected, false,
+-                                                  memory_order_acq_rel,
+-                                                  memory_order_acquire)) {
+-        return false;
+-    }
+-
+-    // The renderer's PTS is relative to the freshly rebased stream.  Anchor
+-    // that media time to "now", rather than allowing a long lock-screen gap
+-    // between resume and the first decoded frame to make PTS zero late.
+-    CMTime first_time = CMTimeMake((int64_t)pts_ns, 1000000000);
+-    CMTimebaseSetRate(s->timebase, 0.0);
+-    CMTimebaseSetTime(s->timebase, first_time);
+-    CMTimebaseSetRate(s->timebase, 1.0);
+-    return true;
+-}
+-
+ /// Create the display layer and host it in `nsview` (AppKit work on the main thread).
+ ///
+ /// MUST NOT dispatch_sync to the main queue — same hazard as destroy() below: this
+@@ -161,14 +130,6 @@
+     void (^build)(void) = ^{
+         AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
+         layer.videoGravity = AVLayerVideoGravityResizeAspect; // honest aspect, letterbox
+-        CMTimebaseRef timebase = NULL;
+-        if (CMTimebaseCreateWithMasterClock(kCFAllocatorDefault,
+-                                            CMClockGetHostTimeClock(), &timebase) == noErr && timebase) {
+-            CMTimebaseSetTime(timebase, kCMTimeZero);
+-            CMTimebaseSetRate(timebase, 1.0);
+-            layer.controlTimebase = timebase;
+-            s->timebase = timebase;
+-        }
+         view.wantsLayer = YES;
+         CALayer *backing = view.layer;
+         backing.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+@@ -189,8 +150,10 @@
+ 
+ /// Wrap an NV12 frame in a CVPixelBuffer + CMSampleBuffer and enqueue it. Safe to
+ /// call from the GStreamer streaming thread (AVSampleBufferDisplayLayer enqueue is
+-/// thread-safe). Valid GStreamer timestamps are retained so the layer can pace
+-/// frames; invalid timestamps fall back to display-immediately mode.
++/// thread-safe). This is a live mirror, not a file/VOD renderer: samples are
++/// deliberately displayed immediately. The callback already receives frames
++/// in arrival order from an unsynchronised appsink, and an AVSampleBuffer
++/// controlTimebase would conflict with DisplayImmediately on macOS.
+ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+                               const unsigned char *uv, unsigned long uv_stride,
+                               int width, int height, uint64_t pts_ns, uint64_t duration_ns) {
+@@ -202,11 +165,11 @@
+         return 0;
+     }
+     AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
+-
+-    // On resume, the first decoded frame establishes the media-to-host clock
+-    // mapping.  Do this before reading readyForMoreMediaData: the old mapping
+-    // is exactly what can keep the layer reporting NO after a long pause.
+-    (void)avlayer_anchor_resume_timebase(s, pts_ns);
++    // The live path intentionally does not schedule samples against their
++    // sender timestamps.  Keep the ABI arguments for the renderer and for
++    // diagnostics, but do not let a stale/rebased PTS stop a live layer.
++    (void)pts_ns;
++    (void)duration_ns;
+ 
+     bool expected_seed = true;
+     bool resume_seed = atomic_compare_exchange_strong_explicit(
+@@ -285,15 +248,7 @@
+     atomic_fetch_add_explicit(&s->format_ns_total, format_elapsed_ns, memory_order_relaxed);
+     avlayer_atomic_max(&s->format_ns_max, format_elapsed_ns);
+ 
+-    CMTime presentation_time = kCMTimeInvalid;
+-    CMTime duration_time = kCMTimeInvalid;
+-    if (pts_ns != UINT64_MAX && s->timebase) {
+-        presentation_time = CMTimeMake((int64_t)pts_ns, 1000000000);
+-    }
+-    if (duration_ns != UINT64_MAX && duration_ns > 0) {
+-        duration_time = CMTimeMake((int64_t)duration_ns, 1000000000);
+-    }
+-    CMSampleTimingInfo timing = { duration_time, presentation_time, kCMTimeInvalid };
++    CMSampleTimingInfo timing = { kCMTimeInvalid, kCMTimeInvalid, kCMTimeInvalid };
+     CMSampleBufferRef sb = NULL;
+     uint64_t sample_started_ns = avlayer_now_ns();
+     OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &timing, &sb);
+@@ -303,12 +258,10 @@
+     avlayer_atomic_max(&s->sample_ns_max, sample_elapsed_ns);
+     bool accepted = (st == noErr && sb != NULL);
+     if (accepted) {
+-        if (!CMTIME_IS_VALID(presentation_time)) {
+-            CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
+-            if (atts && CFArrayGetCount(atts) > 0) {
+-                CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
+-                CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+-            }
++        CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
++        if (atts && CFArrayGetCount(atts) > 0) {
++            CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
++            CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+         }
+         [layer enqueueSampleBuffer:sb];
+         atomic_fetch_add_explicit(&s->enqueue_count, 1, memory_order_relaxed);
+@@ -348,19 +301,13 @@
+     void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
+     if (!layer_ref) return;
+     AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
+-    if (s->timebase) {
+-        CMTimebaseSetRate(s->timebase, 0.0);
+-        CMTimebaseSetTime(s->timebase, kCMTimeZero);
+-        CMTimebaseSetRate(s->timebase, 1.0);
+-    }
+     [layer flushAndRemoveImage];
+ }
+ 
+ /// Clear the image and queued samples after a live video-format transition,
+ /// such as the iPhone changing from the portrait lock screen back to a
+-/// landscape game.  Unlike avlayer_sink_flush(), this deliberately preserves
+-/// the running media timebase: the stream did not pause, only its pixel
+-/// dimensions/orientation changed.
++/// landscape game. Unlike an AirPlay pause, this does not pause the GStreamer
++/// pipeline; it only discards samples in the old pixel format.
+ void avlayer_sink_flush_image(void *sink_) {
+     AVLayerSink *s = (AVLayerSink *)sink_;
+     if (!s) return;
+@@ -375,44 +322,30 @@
+     atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
+ }
+ 
+-/// Pause the presentation clock as well as removing the old image. Keeping the
+-/// timebase stopped prevents a phone lock interval from making the first
+-/// post-unlock timestamp look stale.
++/// Remove the old image on an AirPlay pause marker. The next frame is allowed
++/// through as a one-shot seed and is displayed immediately after resume.
+ void avlayer_sink_pause(void *sink_) {
+     AVLayerSink *s = (AVLayerSink *)sink_;
+     if (!s) return;
+     atomic_store_explicit(&s->pause_started_ns, avlayer_now_ns(), memory_order_release);
+     atomic_store_explicit(&s->waiting_for_resume_frame, true, memory_order_release);
+-    atomic_store_explicit(&s->resume_timebase_anchor_pending, true, memory_order_release);
+     atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
+     void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
+     if (!layer_ref) return;
+     AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
+     [layer flushAndRemoveImage];
+-    if (s->timebase) {
+-        CMTimebaseSetRate(s->timebase, 0.0);
+-        CMTimebaseSetTime(s->timebase, kCMTimeZero);
+-    }
+ }
+ 
+-/// Resume from a fresh zero point. The AirPlay stream sends a new IDR after
+-/// the resume marker, so no old sample is allowed to remain in the queue.
++/// Resume after a fresh flush. The AirPlay stream sends a new IDR after the
++/// resume marker, and the immediate-display path does not need a clock reset.
+ void avlayer_sink_resume(void *sink_) {
+     AVLayerSink *s = (AVLayerSink *)sink_;
+     if (!s) return;
+-    atomic_store_explicit(&s->resume_timebase_anchor_pending, true, memory_order_release);
+     atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
+     void *layer_ref = s ? atomic_load_explicit(&s->layer, memory_order_acquire) : NULL;
+     if (!layer_ref) return;
+     AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
+     [layer flushAndRemoveImage];
+-    if (s->timebase) {
+-        // Keep the clock stopped until the first post-resume frame anchors it.
+-        // The previous implementation started rate=1 here, so a delayed first
+-        // frame with PTS zero arrived already in the past.
+-        CMTimebaseSetRate(s->timebase, 0.0);
+-        CMTimebaseSetTime(s->timebase, kCMTimeZero);
+-    }
+ }
+ 
+ void avlayer_sink_get_diagnostics(void *sink_, AVLayerSinkDiagnostics *out) {
+@@ -478,10 +411,6 @@
+             [layer flushAndRemoveImage];
+             [layer removeFromSuperlayer];
+         }
+-        if (s->timebase) {
+-            CFRelease(s->timebase);
+-            s->timebase = NULL;
+-        }
+         free(s);
+     };
+     if ([NSThread isMainThread]) {
+--- a/renderers/video_renderer.c
++++ b/renderers/video_renderer.c
+@@ -149,11 +149,10 @@
+ #endif
+ 
+ static GstClockTime gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
+-/* PATCH (resume PTS rebase): PAUSED -> PLAYING keeps the GStreamer pipeline
+- * alive, so its base time is not a new media-time origin. The AV layer timebase
+- * is reset on AirPlay resume; rebase the first resumed packet to zero as well,
+- * otherwise the display layer can queue future-dated samples and remain
+- * not-ready after the phone unlocks. */
++/* Timestamp rebase for timestamped sinks. The custom live AVLayer path keeps
++ * this disabled: it uses an unsynchronised appsink and DisplayImmediately
++ * samples, so an AirPlay pause/resume cannot leave its presentation clock
++ * waiting on stale sender timestamps. */
+ static bool gst_video_pts_rebase_pending = false;
+ static GstClockTime gst_video_pts_rebase_origin = GST_CLOCK_TIME_NONE;
+ static unsigned short width, height, width_source, height_source;  /* PATCH: now used to push caps on rotation */
+@@ -885,13 +884,16 @@
+                 /* PATCH (Plan B): "avlayer" -> custom AVSampleBufferDisplayLayer sink.
+                  * We force NV12 into an appsink and pump frames to our own layer
+                  * (see avlayer_on_new_sample / avsample_sink.m).  drop=true +
+-                 * max-buffers keep latency bounded; the appsink itself remains
+-                 * unsynchronised while the AV layer receives the original PTS. */
++                 * max-buffers keep latency bounded; the appsink and the AV
++                 * layer are both arrival-driven for this live mirror path. */
+                 if (!strcmp(videosink, "avlayer") && !jpeg_pipeline) {
+                     g_string_append(launch, "videoconvert ! video/x-raw,format=NV12 ! appsink name=avlayer_");
+                     g_string_append(launch, renderer_type[i]->codec);
+                     g_string_append(launch, " emit-signals=false sync=false max-buffers=3 drop=true");
+-                    vsync_prop = video_sync;
++                    /* Do not attach GStreamer timing to the custom live
++                     * AVLayer path. Its samples are DisplayImmediately and
++                     * its appsink is explicitly unsynchronised. */
++                    vsync_prop = false;
+                 } else {
+ #endif
+                 g_string_append(launch, videosink);
+@@ -1200,7 +1202,7 @@
+      * explicitly so a cover-art-capable build cannot silently strip PTS from
+      * the live video path. */
+     if (!hls_video && type_264 >= 0) {
+-        vsync_prop = video_sync;
++        vsync_prop = (!strcmp(videosink, "avlayer")) ? false : video_sync;
+     }
+ #endif
+ }
+@@ -1223,9 +1225,8 @@
+         return;
+     }
+     if (vsync_prop) {
+-        /* The AV layer timebase is reset before the pipeline is resumed. Arm a
+-         * one-shot media-time rebase so the first post-resume packet starts at
+-         * PTS zero in that same display timebase. */
++        /* Arm a one-shot media-time rebase for timestamped sinks. The custom
++         * live AVLayer path deliberately leaves vsync_prop false. */
+         gst_video_pts_rebase_pending = true;
+         gst_video_pts_rebase_origin = GST_CLOCK_TIME_NONE;
+ #ifdef __APPLE__

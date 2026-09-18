@@ -1,0 +1,55 @@
+--- a/renderers/avsample_sink.m
++++ b/renderers/avsample_sink.m
+@@ -55,4 +55,5 @@ typedef struct AVLayerSink {
+     _Atomic uint64_t resume_recovery_ns_total;
+     _Atomic uint64_t resume_recovery_ns_max;
+     _Atomic uint64_t pause_started_ns;
++    _Atomic uint64_t resume_started_ns;
+     _Atomic bool waiting_for_resume_frame;
+@@ -107,4 +107,5 @@ static void avlayer_init_diagnostics(AVLayerSink *s) {
+     atomic_init(&s->resume_recovery_ns_total, 0);
+     atomic_init(&s->resume_recovery_ns_max, 0);
+     atomic_init(&s->pause_started_ns, 0);
++    atomic_init(&s->resume_started_ns, 0);
+     atomic_init(&s->waiting_for_resume_frame, false);
+@@ -287,6 +287,6 @@ int avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire)) {
+-            uint64_t paused_ns = atomic_load_explicit(&s->pause_started_ns, memory_order_acquire);
++            uint64_t resumed_ns = atomic_load_explicit(&s->resume_started_ns, memory_order_acquire);
+             uint64_t now_ns = avlayer_now_ns();
+-            uint64_t recovery_ns = (paused_ns > 0 && now_ns >= paused_ns) ? now_ns - paused_ns : 0;
++            uint64_t recovery_ns = (resumed_ns > 0 && now_ns >= resumed_ns) ? now_ns - resumed_ns : 0;
+             atomic_fetch_add_explicit(&s->resume_recovery_count, 1, memory_order_relaxed);
+@@ -327,4 +327,5 @@ void avlayer_sink_pause(void *sink_) {
+     AVLayerSink *s = (AVLayerSink *)sink_;
+     if (!s) return;
+     atomic_store_explicit(&s->pause_started_ns, avlayer_now_ns(), memory_order_release);
++    atomic_store_explicit(&s->resume_started_ns, 0, memory_order_release);
+     atomic_store_explicit(&s->waiting_for_resume_frame, true, memory_order_release);
+@@ -341,3 +341,4 @@ void avlayer_sink_resume(void *sink_) {
+     AVLayerSink *s = (AVLayerSink *)sink_;
+     if (!s) return;
++    atomic_store_explicit(&s->resume_started_ns, avlayer_now_ns(), memory_order_release);
+     atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
+--- a/renderers/video_renderer.c
++++ b/renderers/video_renderer.c
+@@ -1242,5 +1242,18 @@ void video_renderer_resume() {
+         avlayer_sink_resume(renderer->avlayer);
+     }
+ #endif
+     gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
++    /* The custom live AVLayer path is unsynchronised and has no clock to
++     * re-anchor. Do not synchronously wait for GStreamer here: the wait can
++     * consume the first 100 ms of the post-resume packet window. The next
++     * appsrc buffer can safely complete the PAUSED -> PLAYING transition.
++     * Keep the bounded state wait for the non-AVLayer paths. */
++#ifdef __APPLE__
++    if (renderer->avlayer) {
++        if (renderer->appsrc) {
++            gst_video_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
++        }
++        return;
++    }
++#endif
+     GstState state;

@@ -1,0 +1,48 @@
+diff --git a/lib/airplay_core.cpp b/lib/airplay_core.cpp
+index 7965368..c026e69 100644
+--- a/lib/airplay_core.cpp
++++ b/lib/airplay_core.cpp
+@@ -16,6 +16,7 @@
+ #include <thread>
+ #include <mutex>
+ #include <cstring>
++#include <atomic>
+
+ /* Entry points exported by uxplay.cpp (same TU set, C linkage). */
+ extern "C" int  airplay_run_blocking(int argc, char *argv[]);
+@@ -45,6 +46,7 @@ struct airplay_core {
+     std::thread       worker;
+     std::mutex        lifecycle;
+     bool              running = false;
++    std::atomic<bool> stop_requested{false};
+
+     /* argv storage kept alive for the worker's lifetime */
+     std::vector<std::string> argv_store;
+@@ -149,9 +151,18 @@ extern "C" AIRPLAY_API int airplay_core_start(airplay_core_t *c) {
+      * lost, not even one issued before the worker has entered the engine. */
+     airplay_clear_shutdown_request();
+
++    c->stop_requested.store(false, std::memory_order_release);
+     c->running = true;
+     c->worker = std::thread([c, argc, argv]() {
+-        airplay_run_blocking(argc, argv);
++        (void) airplay_run_blocking(argc, argv);
++        /* The embedding host has no direct access to std::thread.  Make an
++         * unexpected return observable through the already established log
++         * callback; the host maps this exact marker to its fixed backoff
++         * restart policy.  airplay_core_stop() sets stop_requested before
++         * asking the worker to quit, so an intentional stop stays silent. */
++        if (!c->stop_requested.load(std::memory_order_acquire) && c->log_cb) {
++            c->log_cb(3, "FrameRelay worker exited unexpectedly", c->log_user);
++        }
+     });
+     return 0;
+ }
+@@ -160,6 +171,7 @@ extern "C" AIRPLAY_API void airplay_core_stop(airplay_core_t *c) {
+     if (!c) return;
+     std::lock_guard<std::mutex> lk(c->lifecycle);
+     if (!c->running) return;
++    c->stop_requested.store(true, std::memory_order_release);
+     airplay_request_shutdown();
+     if (c->worker.joinable()) {
+         c->worker.join();

@@ -1,0 +1,98 @@
+diff --git a/renderers/video_renderer.c b/renderers/video_renderer.c
+index 53e2f82..11e172e 100644
+--- a/renderers/video_renderer.c
++++ b/renderers/video_renderer.c
+@@ -136,6 +136,13 @@ static unsigned char X11_search_attempts = 0;
+ #endif
+ 
+ static GstClockTime gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
++/* PATCH (resume PTS rebase): PAUSED -> PLAYING keeps the GStreamer pipeline
++ * alive, so its base time is not a new media-time origin. The AV layer timebase
++ * is reset on AirPlay resume; rebase the first resumed packet to zero as well,
++ * otherwise the display layer can queue future-dated samples and remain
++ * not-ready after the phone unlocks. */
++static bool gst_video_pts_rebase_pending = false;
++static GstClockTime gst_video_pts_rebase_origin = GST_CLOCK_TIME_NONE;
+ static unsigned short width, height, width_source, height_source;  /* PATCH: now used to push caps on rotation */
+ static int last_rotation_hint = -1;  /* PATCH: track packet[5] separately -- both landscapes have same dims */
+ static bool first_packet = false;
+@@ -1171,6 +1178,19 @@ void video_renderer_resume() {
+     if (!renderer) {
+         return;
+     }
++    if (vsync_prop) {
++        /* The AV layer timebase is reset before the pipeline is resumed. Arm a
++         * one-shot media-time rebase so the first post-resume packet starts at
++         * PTS zero in that same display timebase. */
++        gst_video_pts_rebase_pending = true;
++        gst_video_pts_rebase_origin = GST_CLOCK_TIME_NONE;
++#ifdef __APPLE__
++        if (diagnostic_metrics) {
++            logger_log(logger, LOGGER_INFO,
++                       "FrameRelay diagnostic pts: action=resume-rebase-pending");
++        }
++#endif
++    }
+ #ifdef __APPLE__
+     if (renderer->avlayer) {
+         avlayer_sink_resume(renderer->avlayer);
+@@ -1197,6 +1217,8 @@ void video_renderer_start() {
+      * them here makes every session re-derive its orientation from scratch. */
+     last_rotation_hint = -1;
+     width = height = width_source = height_source = 0;
++    gst_video_pts_rebase_pending = false;
++    gst_video_pts_rebase_origin = GST_CLOCK_TIME_NONE;
+     if (hls_video) {
+         if (!renderer) {
+             /* init left the playbin non-READY (it no longer exit()s on that) */
+@@ -1305,16 +1327,46 @@ void video_renderer_display_jpeg(const void *data, int *data_len) {
+ 
+ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
+     GstBuffer *buffer = NULL;
+-    GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
++    GstClockTime raw_pts = (GstClockTime) *ntp_time; /* absolute NTP time in nsecs */
++    GstClockTime pts = raw_pts;
+     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
+     if (vsync_prop) {
+-        if (pts >= gst_video_pipeline_base_time) {
+-            pts -= gst_video_pipeline_base_time;
++        if (gst_video_pts_rebase_pending && raw_pts != GST_CLOCK_TIME_NONE) {
++            gst_video_pts_rebase_origin = raw_pts;
++            gst_video_pts_rebase_pending = false;
++#ifdef __APPLE__
++            if (diagnostic_metrics) {
++                logger_log(logger, LOGGER_INFO,
++                           "FrameRelay diagnostic pts: action=resume-rebase origin_ns=%llu",
++                           (unsigned long long) gst_video_pts_rebase_origin);
++            }
++#endif
++        }
++
++        if (gst_video_pts_rebase_origin != GST_CLOCK_TIME_NONE &&
++            raw_pts != GST_CLOCK_TIME_NONE) {
++            if (raw_pts >= gst_video_pts_rebase_origin) {
++                pts = raw_pts - gst_video_pts_rebase_origin;
++            } else {
++                /* A sender clock reset can move backwards. Start a fresh
++                 * origin instead of producing an underflowed timestamp. */
++                gst_video_pts_rebase_origin = raw_pts;
++                pts = 0;
++#ifdef __APPLE__
++                if (diagnostic_metrics) {
++                    logger_log(logger, LOGGER_INFO,
++                               "FrameRelay diagnostic pts: action=resume-rebase-reset origin_ns=%llu",
++                               (unsigned long long) gst_video_pts_rebase_origin);
++                }
++#endif
++            }
++        } else if (raw_pts >= gst_video_pipeline_base_time) {
++            pts = raw_pts - gst_video_pipeline_base_time;
+         } else {
+             // adjust timestamps to be >= gst_video_pipeline_base time
+             logger_log(logger, LOGGER_DEBUG, "*** invalid ntp_time < gst_video_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
+                        ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_video_pipeline_base_time) / SECOND_IN_NSECS);
+-            return  (uint64_t)  gst_video_pipeline_base_time - pts;
++            return  (uint64_t)  gst_video_pipeline_base_time - raw_pts;
+         }
+     }
+     g_assert(data_len != 0);

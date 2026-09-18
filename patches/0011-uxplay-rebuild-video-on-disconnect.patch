@@ -1,0 +1,56 @@
+From FrameRelay Mon Sep 17 00:00:00 2001
+From: FrameRelay <framerelay@localhost>
+Date: Thu, 17 Sep 2026 00:00:00 +0800
+Subject: [PATCH] uxplay: rebuild the live video renderer after clean disconnect
+
+A normal client disconnect closes the HTTP/RTSP connection without entering
+the video_reset path. FrameRelay clears the host view's AVLayer in response to
+Open connections: 0, leaving a reused renderer feeding a layer that is no
+longer attached to the view. Stop the renderer and arm the existing main-loop
+reconnect path so the next session gets a fresh renderer and host layer.
+
+The HTTP server is deliberately left running: conn_destroy runs on the HTTP
+worker, so stopping and joining that server from this callback would deadlock.
+
+---
+ uxplay.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/uxplay.cpp b/uxplay.cpp
+--- a/uxplay.cpp
++++ b/uxplay.cpp
+@@ -2514,17 +2514,33 @@
+ extern "C" void conn_destroy (void *cls) {
+     //video_renderer_update_background(-1);
+     open_connections--;
+-    LOGD("Open connections: %i", open_connections);
+     if (open_connections == 0) {
+         remote_clock_offset = 0;
+         if (use_audio) {
+             audio_renderer_stop();
+         }
++        /* A normal RTSP disconnect does not enter video_reset().  The host
++         * still clears the VideoHostView layer when it observes Open
++         * connections: 0, so retaining this renderer would leave the next
++         * client feeding an AVSampleBufferDisplayLayer that is no longer
++         * attached to the host view.  Stop the live renderer and send the
++         * existing main-loop reconnect path through a fresh renderer before
++         * the next mirroring session.  Do not reset the HTTP server here:
++         * conn_destroy() runs on the HTTP worker and stopping/joining that
++         * server from its own callback would deadlock. */
++        if (use_video) {
++            video_renderer_stop();
++            full_video_reset = true;
++            relaunch_video = true;
++            reset_loop = true;
++            LOGI("FrameRelay video lifecycle: action=disconnect-reset reason=last-client-closed");
++        }
+         if (dacpfile.length()) {
+             remove (dacpfile.c_str());
+         }
+         if (mux_to_file) {
+             mux_renderer_stop();
+         }
+     }
++    LOGD("Open connections: %i", open_connections);
+ }

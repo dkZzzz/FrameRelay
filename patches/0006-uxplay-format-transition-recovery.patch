@@ -1,0 +1,183 @@
+diff --git a/renderers/avsample_sink.h b/renderers/avsample_sink.h
+--- a/renderers/avsample_sink.h
++++ b/renderers/avsample_sink.h
+@@ -17,6 +17,7 @@ typedef struct AVLayerSinkDiagnostics {
+     uint64_t ready_rejects;
+     uint64_t invalid_inputs;
+     uint64_t layer_failed_flushes;
++    uint64_t format_flushes;
+     uint64_t pixel_buffer_create_count;
+     uint64_t pixel_buffer_create_failures;
+     uint64_t pixel_buffer_create_ns_total;
+@@ -44,6 +45,7 @@ int   avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned long y_stride,
+                                 const unsigned char *uv, unsigned long uv_stride,
+                                 int width, int height, uint64_t pts_ns, uint64_t duration_ns);
+ void  avlayer_sink_flush(void *sink);
++void  avlayer_sink_flush_image(void *sink);
+ void  avlayer_sink_pause(void *sink);
+ void  avlayer_sink_resume(void *sink);
+ void  avlayer_sink_get_diagnostics(void *sink, AVLayerSinkDiagnostics *out);
+diff --git a/renderers/avsample_sink.m b/renderers/avsample_sink.m
+--- a/renderers/avsample_sink.m
++++ b/renderers/avsample_sink.m
+@@ -39,6 +39,7 @@ typedef struct AVLayerSink {
+     _Atomic uint64_t ready_rejects;
+     _Atomic uint64_t invalid_inputs;
+     _Atomic uint64_t layer_failed_flushes;
++    _Atomic uint64_t format_flushes;
+     _Atomic uint64_t pixel_buffer_create_count;
+     _Atomic uint64_t pixel_buffer_create_failures;
+     _Atomic uint64_t pixel_buffer_create_ns_total;
+@@ -94,6 +95,7 @@ static void avlayer_init_diagnostics(AVLayerSink *s) {
+     atomic_init(&s->ready_rejects, 0);
+     atomic_init(&s->invalid_inputs, 0);
+     atomic_init(&s->layer_failed_flushes, 0);
++    atomic_init(&s->format_flushes, 0);
+     atomic_init(&s->pixel_buffer_create_count, 0);
+     atomic_init(&s->pixel_buffer_create_failures, 0);
+     atomic_init(&s->pixel_buffer_create_ns_total, 0);
+@@ -354,6 +356,25 @@ void avlayer_sink_flush(void *sink_) {
+     [layer flushAndRemoveImage];
+ }
+ 
++/// Clear the image and queued samples after a live video-format transition,
++/// such as the iPhone changing from the portrait lock screen back to a
++/// landscape game.  Unlike avlayer_sink_flush(), this deliberately preserves
++/// the running media timebase: the stream did not pause, only its pixel
++/// dimensions/orientation changed.
++void avlayer_sink_flush_image(void *sink_) {
++    AVLayerSink *s = (AVLayerSink *)sink_;
++    if (!s) return;
++    atomic_fetch_add_explicit(&s->format_flushes, 1, memory_order_relaxed);
++    void *layer_ref = atomic_load_explicit(&s->layer, memory_order_acquire);
++    if (!layer_ref) return;
++    AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)layer_ref;
++    [layer flushAndRemoveImage];
++    // Arm the permit after the flush, so a sample racing with the flush cannot
++    // consume the permit and then get removed by the flush itself.  The next
++    // sample is the one that seeds the new format.
++    atomic_store_explicit(&s->resume_seed_pending, true, memory_order_release);
++}
++
+ /// Pause the presentation clock as well as removing the old image. Keeping the
+ /// timebase stopped prevents a phone lock interval from making the first
+ /// post-unlock timestamp look stale.
+@@ -404,6 +425,7 @@ void avlayer_sink_get_diagnostics(void *sink_, AVLayerSinkDiagnostics *out) {
+     AV_COPY_DIAG(ready_rejects);
+     AV_COPY_DIAG(invalid_inputs);
+     AV_COPY_DIAG(layer_failed_flushes);
++    AV_COPY_DIAG(format_flushes);
+     AV_COPY_DIAG(pixel_buffer_create_count);
+     AV_COPY_DIAG(pixel_buffer_create_failures);
+     AV_COPY_DIAG(pixel_buffer_create_ns_total);
+diff --git a/renderers/video_renderer.c b/renderers/video_renderer.c
+--- a/renderers/video_renderer.c
++++ b/renderers/video_renderer.c
+@@ -56,6 +56,8 @@ static logger_t *logger = NULL;
+ #include "avsample_sink.h"
+
+ static bool avlayer_caps_reported = false;
++static int avlayer_last_output_width = 0;
++static int avlayer_last_output_height = 0;
+ static _Atomic uint64_t diagnostic_callback_count = 0;
+
+ static uint64_t avlayer_now_ns(void) {
+@@ -97,10 +99,21 @@ static GstFlowReturn avlayer_on_new_sample(GstAppSink *appsink, gpointer user_data) {
+     if (buf && caps && gst_video_info_from_caps(&info, caps)) {
+         GstVideoFrame frame;
+         if (gst_video_frame_map(&frame, &info, buf, GST_MAP_READ)) {
++            int output_width = GST_VIDEO_FRAME_WIDTH(&frame);
++            int output_height = GST_VIDEO_FRAME_HEIGHT(&frame);
++            if (diagnostic_metrics &&
++                (output_width != avlayer_last_output_width ||
++                 output_height != avlayer_last_output_height)) {
++                logger_log(logger, LOGGER_INFO,
++                           "FrameRelay diagnostic sample: output=%dx%d",
++                           output_width, output_height);
++                avlayer_last_output_width = output_width;
++                avlayer_last_output_height = output_height;
++            }
+             if (avlayer_sink_enqueue_nv12(user_data,
+                 GST_VIDEO_FRAME_PLANE_DATA(&frame, 0), GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0),
+                 GST_VIDEO_FRAME_PLANE_DATA(&frame, 1), GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 1),
+-                GST_VIDEO_FRAME_WIDTH(&frame), GST_VIDEO_FRAME_HEIGHT(&frame),
++                output_width, output_height,
+                 (uint64_t)GST_BUFFER_PTS(buf), (uint64_t)GST_BUFFER_DURATION(buf))) {
+                 avlayer_frames_enqueued++;
+             } else {
+@@ -145,6 +158,13 @@ static bool gst_video_pts_rebase_pending = false;
+ static GstClockTime gst_video_pts_rebase_origin = GST_CLOCK_TIME_NONE;
+ static unsigned short width, height, width_source, height_source;  /* PATCH: now used to push caps on rotation */
+ static int last_rotation_hint = -1;  /* PATCH: track packet[5] separately -- both landscapes have same dims */
++/* The custom AV layer cannot safely keep displaying the old pixel format while
++ * videoflip renegotiates from portrait to landscape.  Remember the last
++ * format/orientation actually applied so a transition gets one controlled
++ * display-layer flush, while repeated geometry callbacks remain harmless. */
++static int last_applied_rotation_method = -1;
++static unsigned short last_applied_width = 0;
++static unsigned short last_applied_height = 0;
+ static bool first_packet = false;
+ static bool vsync_prop = false;  /* PATCH (Plan B / M3): renamed from "sync" -- it collided with libc sync() pulled in by <dispatch/dispatch.h> on macOS */
+ static bool auto_videosink = true;
+@@ -397,6 +417,7 @@ static void diagnostic_log_pipeline_details(video_renderer_t *candidate, double seconds) {
+     logger_log(logger, LOGGER_INFO,
+                "FrameRelay diagnostic avlayer: ready_rejects=%" G_GUINT64_FORMAT
+                " layer_failed_flushes=%" G_GUINT64_FORMAT
++               " format_flushes=%" G_GUINT64_FORMAT
+                " pixel_create=%" G_GUINT64_FORMAT " pixel_create_fail=%" G_GUINT64_FORMAT
+                " pixel_create_avg_ms=%.3f pixel_create_max_ms=%.3f lock_fail=%" G_GUINT64_FORMAT
+                " copy=%" G_GUINT64_FORMAT " copy_avg_ms=%.3f copy_max_ms=%.3f"
+@@ -405,7 +426,7 @@ static void diagnostic_log_pipeline_details(video_renderer_t *candidate, double seconds) {
+                " sample=%" G_GUINT64_FORMAT " sample_fail=%" G_GUINT64_FORMAT
+                " sample_avg_ms=%.3f sample_max_ms=%.3f enqueue=%" G_GUINT64_FORMAT
+                " recovery=%" G_GUINT64_FORMAT " recovery_avg_ms=%.3f recovery_max_ms=%.3f",
+-               sink.ready_rejects, sink.layer_failed_flushes,
++               sink.ready_rejects, sink.layer_failed_flushes, sink.format_flushes,
+                sink.pixel_buffer_create_count, sink.pixel_buffer_create_failures,
+                create_avg_ms, (double)sink.pixel_buffer_create_ns_max / 1000000.0,
+                sink.lock_failures, sink.copy_count, copy_avg_ms,
+@@ -523,7 +544,28 @@ static void apply_rotation_hint(void) {
+             label = "unknown rotation -- aspect fallback";
+             break;
+     }
++    bool format_changed = (method != last_applied_rotation_method ||
++                           width != last_applied_width ||
++                           height != last_applied_height);
+     g_object_set(renderer->rotator, "video-direction", method, NULL);
++#ifdef __APPLE__
++    if (format_changed && renderer->avlayer) {
++        /* Property changes on videoflip can renegotiate the downstream raw
++         * caps.  Flush only the old AVSampleBufferDisplayLayer image/queue
++         * after changing the property, so a raced old sample is discarded and
++         * the next sample is the first one in the new orientation.  Do not
++         * reset the CMTimebase here: this is a format transition, not a pause. */
++        avlayer_sink_flush_image(renderer->avlayer);
++        logger_log(logger, LOGGER_INFO,
++                   "FrameRelay avlayer format transition: old=%dx%d method=%d -> new=%ux%u method=%d",
++                   (unsigned) last_applied_width, (unsigned) last_applied_height,
++                   last_applied_rotation_method,
++                   (unsigned) width, (unsigned) height, method);
++    }
++#endif
++    last_applied_rotation_method = method;
++    last_applied_width = width;
++    last_applied_height = height;
+     logger_log(logger, LOGGER_INFO,
+                "apply_rotation_hint: %ux%u rot=0x%02x -> videoflip method=%d (%s)",
+                (unsigned) width, (unsigned) height, last_rotation_hint, method, label);
+@@ -613,4 +655,6 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+     diagnostic_metrics = diagnostic_metrics_enabled;
+ #ifdef __APPLE__
+     avlayer_caps_reported = false;
++    avlayer_last_output_width = 0;
++    avlayer_last_output_height = 0;
+     diagnostic_reset_renderer_counters();
+@@ -1216,6 +1260,8 @@ void video_renderer_start() {
+      * videoflip (which always launches at video-direction=identity).  Clearing
+      * them here makes every session re-derive its orientation from scratch. */
+     last_rotation_hint = -1;
++    last_applied_rotation_method = -1;
++    last_applied_width = last_applied_height = 0;
+     width = height = width_source = height_source = 0;
+     gst_video_pts_rebase_pending = false;
+     gst_video_pts_rebase_origin = GST_CLOCK_TIME_NONE;

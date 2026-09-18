@@ -1,0 +1,13 @@
+FrameRelay is a personal-use macOS AppKit host for the UxPlay AirPlay receiver.
+
+The AirPlay engine is derived from UxPlay and is included under the GNU General
+Public License, version 3 or later. The pinned source and all source patches are
+kept in third_party/uxplay and patches/.
+
+The application bundles GStreamer, OpenSSL, and libplist runtime components.
+Their license texts are included under Resources/LICENSES in the source tree and
+inside the distributed application bundle.
+
+FrameRelay v0.1 intentionally disables phone audio with UxPlay's -a option. It
+does not request microphone, camera, screen-recording, Apple Events, or App
+Sandbox permissions.

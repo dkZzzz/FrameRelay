@@ -1,0 +1,38 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+
+# Swift Package Manager and Xcode
+.build/
+.swiftpm/
+Package.resolved
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# FrameRelay build and release output
+build/
+dist/
+*.dSYM/
+*.dSYM.zip
+
+# Local runtime and diagnostic state
+*.log
+*.log.*
+gstreamer-registry.bin
+
+# Editor and temporary files
+*.swp
+*.swo
+*.tmp
+*.temp
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
